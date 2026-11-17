@@ -352,8 +352,8 @@ jobs:
           - target: win64
             # Cross-built with MinGW, as upstream's Windows release is.
             runner: ubuntu-latest
-          - target: macos-aarch64
-            runner: macos-latest
+          # fix/taskbar test build: macOS arm64 runners were out of capacity,
+          # so this branch builds the Intel Mac app only (runs on M1 via Rosetta).
           - target: macos-x86_64
             # Upstream's dependency scripts build for the machine they run on.
             runner: macos-15-intel
@@ -673,22 +673,14 @@ jobs:
     # One image, two Rust targets. macos-latest is Apple Silicon and
     # cross-compiles the Intel leg happily; building Intel natively would mean
     # macos-15-intel, the last x86_64 image, which GitHub retires in 2027.
-    runs-on: macos-latest
+    # fix/taskbar test build: Intel runner, Intel app only (arm64 out of capacity).
+    runs-on: macos-15-intel
     strategy:
       # Both arches are shipped, so a failure in one should still let the other
       # be inspected rather than cancelling it.
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            # The download's name for these Macs: Apple's words, not the
-            # CPU's, so nobody has to know aarch64 to pick the right file.
-            label: apple-silicon
-            scrcpy_arch: aarch64
-            # `lipo -archs` spells the same architecture differently from the
-            # scrcpy asset name. Both are needed, so both are written down.
-            lipo_arch: arm64
-            scrcpy_sha256: "33611e51977a8289e2e124b220f727895181ef2eb9060e0987a4dc2db9cf0d6b"
           - target: x86_64-apple-darwin
             label: intel
             scrcpy_arch: x86_64
