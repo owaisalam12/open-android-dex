@@ -356,11 +356,8 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     /** The phone dock's Mouse button, so it can show the touchpad's state. */
     private TextView padButton;
     /** The phone's touchpad and pointer; null until asked for. See {@link DexPointer}. */
-    /** How long a click may wait on the daemon before it is called a failure. */
     /** The geometry of the most recent shapeForDesktop, for the launch path that loses it. */
     private Rect lastShapedBounds;
-
-    private static final long DAEMON_LAUNCH_TIMEOUT_MS = 2500L;
 
     private DexPointer pointer;
     /** Back/Home/Close over the apps, on phones that get no titlebars. Null above API 34. */
@@ -1008,22 +1005,14 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
             return;
         } catch (SecurityException e) {
             if (!refusedByDisplay(e)) throw e;
+            // Built now, on this thread: withoutLaunchDisplay reads the bounds the
+            // caller shaped just before this call, which a later click would replace.
+            final Bundle fallback = withoutLaunchDisplay(options);
             // THE DAEMON FIRST, because it is the only one of the two ways below that
-            // keeps the window where the launcher put it. It starts the activity ON
-            // this display, so the bounds and the freeform mode in the options are
-            // still the ones that apply.
-            if (launchViaDaemon(intent)) {
-                DexLog.step("launch", intent.getComponent() + " — opened by the daemon");
-                // …which is not the same as "opened HERE". `am start --display` is a
-                // request, not a guarantee: an app whose task already exists elsewhere
-                // is brought to the front where it already was, and one that answers
-                // with a trampoline (Chrome's first-run screen) lands wherever that
-                // activity's task belongs. Both end up on the phone. The reclaim is
-                // what makes the display stick, and it is a no-op when the window is
-                // already in the right place.
-                reclaimOntoDesktop(intent);
-                return;
-            }
+            // keeps the window where the launcher put it. ASYNC: the taskbar used to
+            // wait up to 2.5 s here on the main thread, which is
+            // the desktop freezing on every click on a display that refuses us.
+            if (launchViaDaemonAsync(intent, fallback)) return;
             // AND ONLY THEN without naming the display, which is all that is left for
             // our own screens: they are not exported, and an activity that is not
             // exported may be started by its own app and by nobody else, uid 2000
@@ -1035,7 +1024,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
             // by a reclaim, and the bounds are re-applied from the ones the caller
             // last asked for.
             try {
-                super.startActivity(intent, withoutLaunchDisplay(options));
+                super.startActivity(intent, fallback);
                 DexLog.step("launch", intent.getComponent()
                         + " — this display refuses a named launch, opened without one");
                 reclaimOntoDesktop(intent);
@@ -1092,38 +1081,86 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     }
 
     /**
-     * Hand the start to the daemon and wait for its answer.
+     * Hand the start to the daemon, without waiting for its answer.
      *
-     * Blocking on purpose: the caller has to know whether to report a failure, and this
-     * is a tap someone is already waiting on. The socket may not be touched from the
-     * main thread, so the round trip happens on a thread of its own — with a bound on
-     * it, because a daemon that has gone away must turn a click into a message rather
-     * than into a frozen desktop.
+     * Blocking on      * NOT blocking: returns true once the request is on its way, and the answer
+     * comes back to the main thread, which then falls back to a launch without the
+     * display, or says it cannot open the app. The old version waited on the main
+     * thread for up to 2.5 s, and the taskbar froze on every click.
      *
-     * An intent with no component cannot be handed over: `am` needs a name, and an
+th no component cannot be handed over: `am` needs a name, and an
      * implicit intent has none. Those keep the platform's answer.
      */
-    private boolean launchViaDaemon(Intent intent) {
+    /** The platform's startActivity, past the override above. */
+    private void superStartActivity(Intent intent, Bundle options) {
+        super.startActivity(intent, options);
+    }
+
+    private boolean launchViaDaemonAsync(Intent intent, Bundle fallback) {
         final ComponentName component = intent.getComponent();
         final int display = displayId();
         if (component == null || display < 0) return false;
-        final boolean[] done = {false};
+        // Our own screens are not exported, so the daemon (uid 2000) is always
+        // refused them: go straight to the fallback instead of a round trip.
+        if (getPackageName().equals(component.getPackageName())) return false;
         Thread worker = new Thread(() -> {
             WmClient client = new WmClient();
+            boolean ok;
             try {
-                done[0] = client.launch(display, component.flattenToShortString());
+                ok = client.launch(display, component.flattenToShortString());
             } finally {
                 client.shutdown();
             }
+            final boolean opened = ok;
+            handler.post(() -> {
+                if (isDestroyed()) return;
+                if (opened) {
+                    DexLog.step("launch", component + " — opened by the daemon");
+                    // `am start --display` is a request, not a guarantee (a task that
+                    // exists elsewhere, a trampoline): the reclaim makes it stick.
+                    reclaimOntoDesktop(intent);
+                    return;
+                }
+                try {
+                    superStartActivity(intent, fallback);
+                    DexLog.step("launch", component
+                            + " — this display refuses a named launch, opened without one");
+                    reclaimOntoDesktop(intent);
+                } catch (RuntimeException ex) {
+                    DexLog.warn("launch", "cannot open " + component.flattenToShortString(), ex);
+                    AppEntry app = findByPackage(component.getPackageName());
+                    Toast.makeText(this, getString(R.string.lx_cannot_open,
+                            app != null ? app.label : component.getPackageName()),
+                            Toast.LENGTH_SHORT).show();
+                }
+            });
         }, "wmd-launch");
         worker.start();
-        try {
-            worker.join(DAEMON_LAUNCH_TIMEOUT_MS);
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
-        return done[0];
+        return true;
     }
+    /**
+     * A press on the desktop closes the taskbar's popups, as on Windows and DeX.
+     * Not left to the popups' outside-touch alone, which did not always arrive
+     * for a mouse. A press on an in-activity taskbar is left alone: its button
+     * decides for itself whether the click closes its popup (see wasOpen).
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev.getActionMasked() == MotionEvent.ACTION_DOWN && !onActivityTaskbar(ev)) {
+            dismissPopups();
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    private boolean onActivityTaskbar(MotionEvent ev) {
+        if (taskbarView == null || taskbarView.getParent() != rootFrame) return false;
+        int[] at = new int[2];
+        taskbarView.getLocationOnScreen(at);
+        float x = ev.getRawX(), y = ev.getRawY();
+        return x >= at[0] && x < at[0] + taskbarView.getWidth()
+                && y >= at[1] && y < at[1] + taskbarView.getHeight();
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
@@ -2155,6 +2192,10 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
         panel.setPadding(pad, topSystemInset() + drawerTopPad(), pad,
                 bottomReserve() + dp(12));
         panel.setClickable(true);
+        // The DeX drawer fills the desktop, so its empty margins ARE the desktop
+        // as far as the user can tell: a click there closes it, as DeX does.
+        // The tiles and the search field take their own clicks first.
+        panel.setOnClickListener(v -> hideDrawer());
 
         panel.addView(buildPinnedRow(), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -4298,7 +4339,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
         // The gesture reaches this too, and a gesture must not resurrect a
         // surface the setting has taken off the taskbar.
         if (!DexNotifications.enabled(this)) return;
-        if (notifPopup != null && notifPopup.isShowing()) {
+        if (wasOpen(notifPopup)) {
             dismissPopups();
             return;
         }
@@ -4404,7 +4445,13 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
                         bottomReserve() + dp(12));
             }
             if (drawer.getParent() == null) {
-                rootFrame.addView(drawer, new FrameLayout.LayoutParams(
+                // UNDER the taskbar when the bar is in this activity too: added on
+                // top, the drawer's clickable panel covered the bar, so neither the
+                // Apps button nor anything else on it could close the drawer, only
+                // Esc. The panel's bottom padding already leaves the bar its room.
+                int under = taskbarView != null && taskbarView.getParent() == rootFrame
+                        ? rootFrame.indexOfChild(taskbarView) : -1;
+                rootFrame.addView(drawer, under, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
             }
             drawer.setVisibility(View.VISIBLE);
@@ -4499,11 +4546,33 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
         homePopup = null;
     }
 
+    /** The popup an outside touch closed last, and when; see {@link #wasOpen}. */
+    private PopupWindow lastDismissed;
+    private long lastDismissedAt;
+
+    /**
+     * Was this popup open when the click that is asking began? True while it is
+     * showing, and for a moment after an outside touch closed it, which is the
+     * press of that same click.
+     */
+    private boolean wasOpen(PopupWindow p) {
+        if (p == null) return false;
+        if (p.isShowing()) return true;
+        return p == lastDismissed && SystemClock.uptimeMillis() - lastDismissedAt < 500;
+    }
+
     private PopupWindow makePopup(View content) {
         PopupWindow popup = new PopupWindow(content,
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         popup.setBackgroundDrawable(roundedFill(theme.card(), 14));
         popup.setOutsideTouchable(true);
+        // A click on the taskbar button that opened this popup lands OUTSIDE it,
+        // so the popup is dismissed on the press and the button's click then saw
+        // it closed and opened it again: the popup could not be toggled shut.
+        popup.setOnDismissListener(() -> {
+            lastDismissed = popup;
+            lastDismissedAt = SystemClock.uptimeMillis();
+        });
         popup.setElevation(dp(12));
         DexFonts.applyTo(this, content);
         // Every tray flyout is its own window; this one call covers all of them.
@@ -4535,7 +4604,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     // ── Open-apps popup: what's running on this display, most recent
     // (topmost) first, each row with a kill button ──
     private void toggleRecentsPopup() {
-        if (recentsPopup != null && recentsPopup.isShowing()) {
+        if (wasOpen(recentsPopup)) {
             dismissPopups();
             return;
         }
@@ -4610,7 +4679,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
 
     // ── Calendar popup: current month, today highlighted ──
     private void toggleCalendarPopup() {
-        if (calendarPopup != null && calendarPopup.isShowing()) {
+        if (wasOpen(calendarPopup)) {
             dismissPopups();
             return;
         }
@@ -4721,7 +4790,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     }
 
     private void toggleBatteryPopup() {
-        if (batteryPopup != null && batteryPopup.isShowing()) {
+        if (wasOpen(batteryPopup)) {
             dismissPopups();
             return;
         }
@@ -5010,7 +5079,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     }
 
     private void toggleQuickSettingsPopup() {
-        if (qsPopup != null && qsPopup.isShowing()) {
+        if (wasOpen(qsPopup)) {
             dismissPopups();
             return;
         }
@@ -5292,7 +5361,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
      * </ul>
      */
     private void toggleMediaOutputPopup() {
-        if (mediaPopup != null && mediaPopup.isShowing()) {
+        if (wasOpen(mediaPopup)) {
             dismissPopups();
             return;
         }
@@ -5746,7 +5815,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
      * there, on a desktop where it can never appear.
      */
     private void showPadOptions() {
-        if (padPopup != null && padPopup.isShowing()) {
+        if (wasOpen(padPopup)) {
             dismissPopups();
             return;
         }
@@ -6045,7 +6114,7 @@ public class LauncherActivity extends Activity implements WidgetLaunch.Desktop {
     // ── Tray: exit DeX ──
 
     private void toggleExitPopup() {
-        if (exitPopup != null && exitPopup.isShowing()) {
+        if (wasOpen(exitPopup)) {
             dismissPopups();
             return;
         }

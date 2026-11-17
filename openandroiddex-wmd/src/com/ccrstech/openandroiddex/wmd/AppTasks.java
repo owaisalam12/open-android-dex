@@ -72,10 +72,19 @@ final class AppTasks {
     }
 
     static String start(Intent intent, int displayId) {
+        return start(intent, displayId, true);
+    }
+
+    /**
+     * As {@link #start(Intent, int)}, but {@code fullscreen} false leaves the
+     * windowing mode to the display: the desktop's LAUNCH (WmDaemon) wants its
+     * freeform windows, not an app window's fullscreen.
+     */
+    static String start(Intent intent, int displayId, boolean fullscreen) {
         ComponentName component = intent.getComponent();
         ActivityOptions options = ActivityOptions.makeBasic();
         options.setLaunchDisplayId(displayId);
-        try {
+        if (fullscreen) try {
             // Hidden, and there since Android 9. A display the desktop's freeform
             // switch was flipped for would otherwise open the app as a small
             // window inside its own window.
@@ -105,8 +114,11 @@ final class AppTasks {
         if (intent.hasExtra("xid")) {
             throw new Refl.WmError("cannot start the Linux window's task: " + why);
         }
-        String out = exec(10, "cmd", "activity", "start-activity", "--display", String.valueOf(displayId),
-                "--windowingMode", String.valueOf(FULLSCREEN), "-n", component.flattenToShortString());
+        String out = fullscreen
+                ? exec(10, "cmd", "activity", "start-activity", "--display", String.valueOf(displayId),
+                        "--windowingMode", String.valueOf(FULLSCREEN), "-n", component.flattenToShortString())
+                : exec(10, "cmd", "activity", "start-activity", "--display", String.valueOf(displayId),
+                        "-n", component.flattenToShortString());
         if (out.contains("Error") || out.contains("Exception")) {
             throw new Refl.WmError("cannot start " + component.flattenToShortString() + ": " + why + "; " + out.trim());
         }

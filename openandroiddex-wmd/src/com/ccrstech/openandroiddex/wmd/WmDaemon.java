@@ -293,6 +293,23 @@ public final class WmDaemon {
                     out.println("ERR not a component: " + comp);
                     return;
                 }
+                // FAST PATH FIRST: the same in-process start the app windows use
+                // (AppTasks), minus their forced fullscreen. Booting `am` costs up to a
+                // second on a slow phone, and the launcher's taskbar waits on this
+                // answer. `am` stays as the fallback for a build no binding fits.
+                android.content.ComponentName cn = android.content.ComponentName.unflattenFromString(comp);
+                if (cn != null) {
+                    try {
+                        AppTasks.start(new android.content.Intent(android.content.Intent.ACTION_MAIN)
+                                .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+                                .setComponent(cn)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK), display, false);
+                        out.println("OK");
+                        return;
+                    } catch (Throwable ignored) {
+                        // fall through to `am`
+                    }
+                }
                 String reply = sh("am start --display " + display + " -n '" + comp + "'");
                 // `am` reports a refusal on stdout and still exits 0, so the text is the
                 // only answer there is.
